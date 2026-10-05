@@ -285,3 +285,137 @@ class ReassignInfeasibleResponse(BaseModel):
 
 AssignResponse = Union[FeasibleResponse, InfeasibleResponse]
 ReassignResponse = Union[ReassignFeasibleResponse, ReassignInfeasibleResponse]
+
+
+# ---------------------------------------------------------------------------
+# Persistent review batches
+# ---------------------------------------------------------------------------
+
+
+class BatchCreateRequest(AssignRequest):
+    """创建评审批次：在 /assign 请求的基础上增加全局唯一的批次 ID。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "batch_id": "batch-2026-10",
+                    "manuscripts": [
+                        {"id": "m1", "topics": ["nlp", "ml"], "required_reviewers": 2},
+                        {"id": "m2", "topics": ["vision"], "required_reviewers": 1},
+                    ],
+                    "reviewers": [
+                        {
+                            "id": "r1",
+                            "scores": {"nlp": 5, "ml": 4},
+                            "capacity": 2,
+                            "conflicts": ["m2"],
+                        },
+                        {
+                            "id": "r2",
+                            "scores": {"nlp": 3, "vision": 5},
+                            "capacity": 1,
+                            "conflicts": [],
+                        },
+                        {
+                            "id": "r3",
+                            "scores": {"ml": 4, "vision": 2},
+                            "capacity": 2,
+                            "conflicts": [],
+                        },
+                    ],
+                }
+            ]
+        }
+    )
+
+    batch_id: str = Field(
+        min_length=1,
+        max_length=128,
+        description="批次 ID（全局唯一；已存在时拒绝创建，不覆盖原记录）",
+    )
+
+
+class BatchState(BaseModel):
+    """批次的当前版本状态：输入、完整分派、已确认关系与版本号。"""
+
+    batch_id: str = Field(description="批次 ID")
+    version: int = Field(ge=1, description="当前版本号（每次确认/改派发布后递增）")
+    manuscripts: list[ManuscriptIn] = Field(description="创建批次时的稿件输入")
+    reviewers: list[ReviewerIn] = Field(description="创建批次时的评审人输入")
+    assignments: list[AssignmentOut] = Field(
+        description="当前版本的完整分派，按 (稿件 ID, 评审人 ID) 字典序排列"
+    )
+    confirmed: list[AssignmentRelation] = Field(
+        description="当前已登记确认的关系，按 (稿件 ID, 评审人 ID) 排序"
+    )
+    total_score: float = Field(description="当前分派的总匹配分")
+    max_load_ratio: float = Field(description="当前分派的评审人最大负载率")
+    loads: dict[str, int] = Field(description="每名评审人被指派的稿件数")
+
+
+class ConfirmRequest(BaseModel):
+    """按读取时的版本登记确认关系（乐观并发控制）。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "version": 1,
+                    "relations": [{"manuscript_id": "m1", "reviewer_id": "r1"}],
+                }
+            ]
+        }
+    )
+
+    version: int = Field(ge=1, description="读取批次时得到的版本号")
+    relations: list[AssignmentRelation] = Field(
+        min_length=1,
+        description="要登记为已确认的关系（必须属于当前分派，且不重复）",
+    )
+
+
+class WithdrawRequest(BaseModel):
+    """评审人退出：按读取时的版本求解改派，并把完整改派发布为下一版本。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [{"version": 2, "withdrawn_reviewer_id": "r2"}]
+        }
+    )
+
+    version: int = Field(ge=1, description="读取批次时得到的版本号")
+    withdrawn_reviewer_id: str = Field(
+        min_length=1, description="退出评审人的 ID（必须在批次评审人列表中）"
+    )
+
+
+class BatchReassignFeasibleResponse(BatchState):
+    """改派发布成功后的批次新版本（含相对上一版本的撤销/新增关系）。"""
+
+    status: Literal["feasible"] = "feasible"
+    revoked: list[AssignmentRelation] = Field(
+        description="相对上一版本被撤销的关系（含退出者的全部关系），按 (稿件 ID, 评审人 ID) 排序"
+    )
+    added: list[AssignmentRelation] = Field(
+        description="相对上一版本新增的关系，按 (稿件 ID, 评审人 ID) 排序"
+    )
+
+
+class BatchReassignInfeasibleResponse(BaseModel):
+    """改派无解：批次、确认与版本均保持不变。"""
+
+    status: Literal["infeasible"] = "infeasible"
+    batch_id: str = Field(description="批次 ID")
+    version: int = Field(description="当前版本号（改派无解时保持不变）")
+    reason: str = Field(description="无解原因")
+
+
+class VersionConflict(BaseModel):
+    """版本冲突：请求携带的版本已过期，响应携带当前版本号。"""
+
+    detail: str = Field(description="冲突说明")
+    current_version: int = Field(description="服务器上的当前版本号")
+
+
+BatchReassignResponse = Union[BatchReassignFeasibleResponse, BatchReassignInfeasibleResponse]

@@ -5,6 +5,11 @@ services:
     container_name: peer-review-assigner
     ports:
       - "8000:8000"
+    environment:
+      # 批次数据保存在命名卷中的 SQLite 文件里，容器重启后仍可查询。
+      - BATCH_DB_PATH=/data/batches.db
+    volumes:
+      - batch-data:/data
     restart: unless-stopped
     healthcheck:
       test:
@@ -16,3 +21,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  batch-data:
