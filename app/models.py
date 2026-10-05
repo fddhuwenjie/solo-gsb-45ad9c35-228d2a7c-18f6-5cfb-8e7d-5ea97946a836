@@ -283,5 +283,99 @@ class ReassignInfeasibleResponse(BaseModel):
     reason: str = Field(description="无解原因")
 
 
+# ---------------------------------------------------------------------------
+# Review batches (persisted, versioned review rounds)
+# ---------------------------------------------------------------------------
+
+
+class BatchCreateRequest(AssignRequest):
+    """创建评审批次：在 /assign 的输入之外提供批次 ID。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "batch_id": "batch-2026-10",
+                    "manuscripts": [
+                        {"id": "m1", "topics": ["nlp", "ml"], "required_reviewers": 2},
+                        {"id": "m2", "topics": ["vision"], "required_reviewers": 1},
+                    ],
+                    "reviewers": [
+                        {
+                            "id": "r1",
+                            "scores": {"nlp": 5, "ml": 4},
+                            "capacity": 2,
+                            "conflicts": ["m2"],
+                        },
+                        {
+                            "id": "r2",
+                            "scores": {"nlp": 3, "vision": 5},
+                            "capacity": 1,
+                            "conflicts": [],
+                        },
+                        {
+                            "id": "r3",
+                            "scores": {"ml": 4, "vision": 2},
+                            "capacity": 2,
+                            "conflicts": [],
+                        },
+                    ],
+                }
+            ]
+        }
+    )
+
+    batch_id: str = Field(min_length=1, description="批次 ID（唯一，重复 ID 不覆盖）")
+
+
+class BatchConfirmationRequest(BaseModel):
+    version: int = Field(ge=1, description="读取批次时看到的版本（乐观并发）")
+    relations: list[AssignmentRelation] = Field(
+        min_length=1, description="要在当前版本上登记确认的关系列表（不可重复）"
+    )
+
+    @field_validator("relations")
+    @classmethod
+    def _relations_unique(cls, value: list[AssignmentRelation]) -> list[AssignmentRelation]:
+        pairs = [(r.manuscript_id, r.reviewer_id) for r in value]
+        if len(set(pairs)) != len(pairs):
+            raise ValueError("确认关系不可重复")
+        return value
+
+
+class BatchReassignmentRequest(BaseModel):
+    version: int = Field(ge=1, description="读取批次时看到的版本（乐观并发）")
+    withdrawn_reviewer_id: str = Field(min_length=1, description="退出评审人的 ID")
+
+
+class BatchStateResponse(BaseModel):
+    """批次当前状态：当前输入、分派、确认与版本。"""
+
+    batch_id: str = Field(description="批次 ID")
+    version: int = Field(description="当前版本（初始为 1，每次确认/发布递增）")
+    input: AssignRequest = Field(description="创建批次时传入的稿件与评审人输入")
+    assignment: FeasibleResponse = Field(description="当前版本的完整分派")
+    confirmed: list[AssignmentRelation] = Field(
+        description="当前版本已登记确认的关系，按 (稿件 ID, 评审人 ID) 排序"
+    )
+
+
+class BatchConfirmationResponse(BatchStateResponse):
+    pass
+
+
+class BatchReassignmentFeasibleResponse(ReassignFeasibleResponse):
+    version: int = Field(description="发布后的新版本号")
+    batch_id: str = Field(description="批次 ID")
+
+
+class BatchReassignmentInfeasibleResponse(ReassignInfeasibleResponse):
+    version: int = Field(description="当前版本（无解时版本不变）")
+    batch_id: str = Field(description="批次 ID")
+
+
 AssignResponse = Union[FeasibleResponse, InfeasibleResponse]
 ReassignResponse = Union[ReassignFeasibleResponse, ReassignInfeasibleResponse]
+BatchReassignmentResponse = Union[
+    BatchReassignmentFeasibleResponse, BatchReassignmentInfeasibleResponse
+]

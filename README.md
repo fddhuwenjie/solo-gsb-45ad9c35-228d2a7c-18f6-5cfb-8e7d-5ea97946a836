@@ -4,6 +4,10 @@
 输出满足全部约束的最优分派；无解时返回最小容量缺口证明。另提供应急改派接口：
 评审人退出后，对已下发的分派做尽量少改动的补齐。
 
+此外支持把已下发的分派保存为**可查询的评审批次**（本地 SQLite 持久化、Compose 卷
+跨重启保留）：批次带单调递增的**版本**，可在当前版本上登记确认；评审人退出时复用
+`/reassign` 求解并发布为下一版本，确认与发布均采用乐观并发控制。
+
 ## 规则说明
 
 - **匹配分**：某 (稿件, 评审人) 组合的匹配分 = 评审人对该稿件**各主题评分之和**。
@@ -39,8 +43,12 @@ docker compose up --build
 
 | 地址 | 说明 |
 | --- | --- |
-| `http://localhost:8000/assign` | `POST` 求解分派 |
-| `http://localhost:8000/reassign` | `POST` 评审人退出后的应急改派 |
+| `http://localhost:8000/assign` | `POST` 求解分派（无状态） |
+| `http://localhost:8000/reassign` | `POST` 评审人退出后的应急改派（无状态） |
+| `http://localhost:8000/batches` | `POST` 创建评审批次（先求完整分派再落库） |
+| `http://localhost:8000/batches/{id}` | `GET` 查询批次当前输入/分派/确认/版本 |
+| `http://localhost:8000/batches/{id}/confirmations` | `POST` 在当前版本登记确认 |
+| `http://localhost:8000/batches/{id}/reassignments` | `POST` 评审人退出，发布下一版本 |
 | `http://localhost:8000/health` | `GET` 健康检查 |
 | `http://localhost:8000/docs` | Swagger UI 交互文档 |
 | `http://localhost:8000/openapi.json` | OpenAPI 规范 |
@@ -272,6 +280,152 @@ curl -s -X POST http://localhost:8000/reassign \
 }
 ```
 
+## 评审批次（持久化、带版本）
+
+批次把已下发的分派保存下来，之后可以反复登记确认、在评审人退出时发布新版本。
+
+- **存储**：本地 SQLite（标准库 `sqlite3`，无需额外服务）。`docker compose` 已挂载
+  命名卷 `peer-review-data` 到容器内 `/srv/app/data`，数据库文件为
+  `/srv/app/data/peer_review.db`（可用环境变量 `PEER_REVIEW_DB` 覆盖），
+  **容器重启/重建后批次仍可查询**。
+- **版本**：创建成功时 `version = 1`；每次成功的确认或发布使版本 **+1**。
+  无解的改派不消耗版本。
+- **乐观并发**：确认与发布都必须携带读取时看到的 `version`。同一版本上的并发请求
+  **只有一个生效**；旧版本返回 `409 Conflict`，并在响应中给出 `current_version`。
+- **无解不落地**：创建时先复用 `/assign` 求解，只有存在完整分派才保存——重复 ID
+  返回 `409` 且不覆盖旧记录，输入无解返回 `422`（响应体 `detail.result` 内为
+  `/assign` 同款容量缺口证明），不写任何记录。
+- **改派发布**：评审人退出时，服务端以**批次内当前版本的原关系**与**确认记录**
+  调用现有 `/reassign` 求解：撤销退出者的关系及其确认，其他确认随版本保留，
+  把完整改派连同 `revoked`/`added` 发布为下一版本（`201 Created`）。
+  改派无解时返回 `200` + `{"status": "infeasible", ...}`，**批次、确认与版本均不变**。
+
+### 1. 创建批次 `POST /batches`
+
+请求体与 `/assign` 相同，另加 `batch_id`：
+
+```bash
+curl -s -X POST http://localhost:8000/batches \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "batch_id": "batch-2026-10",
+    "manuscripts": [
+      {"id": "m1", "topics": ["nlp", "ml"], "required_reviewers": 2},
+      {"id": "m2", "topics": ["vision"], "required_reviewers": 1}
+    ],
+    "reviewers": [
+      {"id": "r1", "scores": {"nlp": 5, "ml": 4}, "capacity": 2, "conflicts": ["m2"]},
+      {"id": "r2", "scores": {"nlp": 3, "vision": 5}, "capacity": 1, "conflicts": []},
+      {"id": "r3", "scores": {"ml": 4, "vision": 2}, "capacity": 2, "conflicts": []}
+    ]
+  }'
+```
+
+成功返回 `201 Created`，批次状态结构（后续 `GET` 与确认响应同构）：
+
+```json
+{
+  "batch_id": "batch-2026-10",
+  "version": 1,
+  "input": { "manuscripts": ["…回显创建时传入的稿件与评审人…"], "reviewers": ["…"] },
+  "assignment": {
+    "status": "feasible",
+    "assignments": [
+      {"manuscript_id": "m1", "reviewer_id": "r1", "score": 9.0},
+      {"manuscript_id": "m1", "reviewer_id": "r3", "score": 4.0},
+      {"manuscript_id": "m2", "reviewer_id": "r2", "score": 5.0}
+    ],
+    "total_score": 18.0,
+    "max_load_ratio": 1.0,
+    "loads": {"r1": 1, "r2": 1, "r3": 1}
+  },
+  "confirmed": []
+}
+```
+
+- 批次 ID 重复：`409 {"detail": {"message": "批次 ID 已存在，拒绝覆盖: …"}}`。
+- 输入无解：`422`，`detail.result` 为容量缺口证明；可用同一 ID 修改输入后重试。
+
+### 2. 查询批次 `GET /batches/{batch_id}`
+
+```bash
+curl -s http://localhost:8000/batches/batch-2026-10
+```
+
+返回当前 `input`（创建时的稿件/评审人）、`assignment`（当前版本的完整分派）、
+`confirmed`（已确认关系）与 `version`；批次不存在返回 `404`。
+
+### 3. 登记确认 `POST /batches/{batch_id}/confirmations`
+
+携带读取时的版本与要确认的关系（必须属于当前版本分派、不可重复、不可重复登记）：
+
+```bash
+curl -s -X POST http://localhost:8000/batches/batch-2026-10/confirmations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": 1,
+    "relations": [{"manuscript_id": "m1", "reviewer_id": "r1"}]
+  }'
+```
+
+成功返回 `200` 与批次最新状态（此时 `version` 变为 2，`confirmed` 含该关系）。
+版本过期返回：
+
+```json
+{
+  "detail": {"code": "version_conflict", "message": "版本已过期，当前版本为 2", "current_version": 2}
+}
+```
+
+### 4. 评审人退出并发布下一版本 `POST /batches/{batch_id}/reassignments`
+
+```bash
+curl -s -X POST http://localhost:8000/batches/batch-2026-10/reassignments \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 2, "withdrawn_reviewer_id": "r2"}'
+```
+
+服务端以批次内原关系（m1←{r1,r3}、m2←r2）与确认记录（m1←r1）调用改派求解，
+成功返回 `201 Created`：
+
+```json
+{
+  "status": "feasible",
+  "assignments": [
+    {"manuscript_id": "m1", "reviewer_id": "r1", "score": 9.0},
+    {"manuscript_id": "m1", "reviewer_id": "r3", "score": 4.0},
+    {"manuscript_id": "m2", "reviewer_id": "r3", "score": 2.0}
+  ],
+  "revoked": [{"manuscript_id": "m2", "reviewer_id": "r2"}],
+  "added": [{"manuscript_id": "m2", "reviewer_id": "r3"}],
+  "total_score": 15.0,
+  "max_load_ratio": 1.0,
+  "loads": {"r1": 1, "r2": 0, "r3": 2},
+  "batch_id": "batch-2026-10",
+  "version": 3
+}
+```
+
+此后 `GET /batches/batch-2026-10` 看到的分派即新版本，m1←r1 的确认继续保留，
+退出者 r2 的关系与其确认被撤销。若改派无解，返回 `200`：
+
+```json
+{"status": "infeasible", "reason": "退出者撤销后，剩余评审人无法满足全部稿件需求",
+ "batch_id": "batch-2026-10", "version": 2}
+```
+
+此时批次分派、确认与版本都保持原状（仍为版本 2，可用相同版本重试）。版本过期返回
+`409` 与 `current_version`；退出者不在批次评审人列表中返回 `422`。
+
+### 持久化与并发说明
+
+- SQLite 以 WAL 模式运行；`docker compose down` 后再次 `up`（不删除卷）数据仍在。
+  删除数据卷会清空批次：`docker compose down -v`。
+- 本地开发时默认数据库为工作目录下 `./data/peer_review.db`，可用
+  `PEER_REVIEW_DB=/path/to.db uvicorn app.main:app` 覆盖。
+- 所有写操作在 `BEGIN IMMEDIATE` 事务中完成读-改-写并在事务内核验版本，因此同一版本
+  上的并发确认/发布只有一个成功，其余得到 `409`。
+
 ## 实现要点
 
 - 分派建模为二分图 b-匹配：源点 → 稿件（容量 = 所需评审数）→ 评审人（容量 = 1，
@@ -289,6 +443,13 @@ curl -s -X POST http://localhost:8000/reassign \
   求**最小最大负载率**；最后以「保留数 × 大权重 + 匹配分 × 2^M + 字典序指数权重」
   一次最小费用流完成三级优化。已确认部分在所有解中恒定，因此优化残差问题等价于
   优化整体问题。
+- 批次（`/batches*`）不在求解器中另起炉灶：创建时直接调用同一 `assign`，
+  发布退出时用批次内当前版本的原关系与确认记录调用同一 `reassign`。
+- 持久化用标准库 `sqlite3`（WAL）：`batches` 表保存当前版本号、输入与当前分派
+  （JSON），`confirmations` 表保存当前版本的确认关系；每次写操作在
+  `BEGIN IMMEDIATE` 事务中完成「读版本 → 校验/求解 → 写新版本」，以进程内锁与
+  SQLite 写事务串行化并发请求，实现同一版本仅一个请求生效的乐观并发控制。
+  改派无解时回滚事务，批次、确认与版本均不变。
 
 ## 本地开发（不用 Docker）
 
@@ -302,13 +463,16 @@ python -m pytest                # 运行测试（含与暴力枚举对照的随�
 
 ```
 app/
-  main.py      # FastAPI 应用：/assign、/reassign、/health、自动 OpenAPI
+  main.py      # FastAPI 应用：/assign、/reassign、/batches*、/health、自动 OpenAPI
   models.py    # 请求校验与响应模型（Pydantic）
   solver.py    # 基于 NetworkX 最大流/最小费用流的求解器（含应急改派）
+  batches.py   # 评审批次服务：复用求解器、版本控制与事务编排
+  storage.py   # 本地 SQLite 持久化（WAL、串行写事务）
 tests/
-  test_api.py  # 单元测试 + 暴力枚举对照的随机化测试（含应急改派）
+  test_api.py      # 单元测试 + 暴力枚举对照的随机化测试（含应急改派）
+  test_batches.py  # 批次：创建/查询/确认/发布、并发冲突、重启持久化
 Dockerfile
-docker-compose.yml
-requirements.txt        # 运行时依赖
+docker-compose.yml       # 含 peer-review-data 命名卷，SQLite 跨重启持久化
+requirements.txt        # 运行时依赖（SQLite 使用 Python 标准库）
 requirements-dev.txt    # 额外测试依赖
 ```
